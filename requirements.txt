@@ -1,0 +1,10 @@
+PyQt5>=5.15.0
+opencv-python>=4.5.0
+Pillow>=8.0.0
+numpy>=1.19.0
+rawpy>=0.16.0
+piexif>=1.1.3
+# Optional dependencies for advanced background removal methods
+rembg>=2.0.0  # For neural network-based removal (Method 8)
+torch>=1.9.0  # For U-Net/DeepLabV3 models (Method 10)
+torchvision>=0.10.0  # For pre-trained models
