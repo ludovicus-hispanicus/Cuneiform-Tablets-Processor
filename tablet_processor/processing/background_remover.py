@@ -12,6 +12,15 @@ import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 from PIL import Image
 
+try:
+    from detectron2 import model_zoo
+    from detectron2.engine import DefaultPredictor
+    from detectron2.config import get_cfg
+    import torch
+    DETECTRON2_AVAILABLE = True
+except ImportError:
+    DETECTRON2_AVAILABLE = False
+    
 class BackgroundRemover(QThread):
     """Worker thread to handle background removal without freezing UI"""
     progress_update = pyqtSignal(int)
@@ -168,11 +177,47 @@ class BackgroundRemover(QThread):
             
             # Process based on selected method
             if self.method == 1:
-                result = self.bg_remove_method1(image)
+                    clahe_clip = params.get('clahe_clip', 4.0)
+                    block_size = params.get('block_size', 15)
+                    c_constant = params.get('c_constant', 2)
+                    dilate_iterations = params.get('dilate_iterations', 1)
+                    
+                    result = self.bg_remove_method1(
+                        image,
+                        clahe_clip=clahe_clip,
+                        block_size=block_size,
+                        c_constant=c_constant,
+                        dilate_iterations=dilate_iterations
+                    )
             elif self.method == 2:
-                result = self.bg_remove_method2(image)
+                block_size = params.get('block_size', 15)
+                c_constant = params.get('c_constant', 2)
+                pre_blur = params.get('pre_blur', 5)
+                post_blur = params.get('post_blur', 0)
+                result = self.bg_remove_method2(
+                    image, 
+                    block_size=block_size, 
+                    c_constant=c_constant,
+                    pre_blur=pre_blur,
+                    post_blur=post_blur
+                )
             elif self.method == 3:
-                result = self.bg_remove_method3(image)
+                s_thresh = params.get('s_threshold', 30)
+                v_thresh = params.get('v_threshold', 30)
+                open_size = params.get('morph_open_size', 3)
+                close_size = params.get('morph_close_size', 5)
+                min_area = params.get('min_contour_area', 0.1)
+                debug = params.get('debug', False)
+                
+                result = self.bg_remove_method3(
+                    image,
+                    s_threshold=s_thresh,
+                    v_threshold=v_thresh,
+                    morph_open_size=open_size,
+                    morph_close_size=close_size,
+                    min_contour_area=min_area,
+                    debug=debug
+                )
             elif self.method == 4:
                 block_size = params.get('block_size', 11)
                 c_constant = params.get('c_constant', 2)
@@ -182,21 +227,32 @@ class BackgroundRemover(QThread):
                 high_threshold = params.get('high_threshold', 100)
                 dilation_iterations = params.get('dilation_iterations', 3)
                 result = self.bg_remove_method5(image, low_threshold, high_threshold, dilation_iterations)
-            elif self.method == 6:
-                k = params.get('k_clusters', 2)
-                bg_detection_mode = params.get('bg_detection_mode', 'darkest')
-                result = self.bg_remove_method6(image, k, bg_detection_mode)
-            elif self.method == 7:
-                clahe_clip = params.get('clahe_clip', 4.0)
-                edge_sensitivity = params.get('edge_sensitivity', 3)
-                iterations = params.get('iterations', 10)
-                result = self.bg_remove_method7(image, clahe_clip, edge_sensitivity, iterations)
+            
             elif self.method == 8:
-                result = self.bg_remove_rembg(image)
+                model_name = params.get('model_name', 'u2net')
+                alpha_matting = params.get('alpha_matting', True)
+                alpha_matting_foreground_threshold = params.get('alpha_matting_foreground_threshold', 240)
+                alpha_matting_background_threshold = params.get('alpha_matting_background_threshold', 10)
+                alpha_matting_erode_size = params.get('alpha_matting_erode_size', 10)
+                
+                result = self.bg_remove_rembg(
+                    image,
+                    model_name=model_name,
+                    alpha_matting=alpha_matting,
+                    alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+                    alpha_matting_background_threshold=alpha_matting_background_threshold,
+                    alpha_matting_erode_size=alpha_matting_erode_size
+                )
             elif self.method == 9:
-                result = self.bg_remove_ml(image)    
+                result = self.bg_remove_otsu_contour(image)    
             elif self.method == 10:
-                result = self.bg_remove_otsu_contour(image)
+                # Make sure this calls the DeepLabV3 method, not otsu_contour
+                result = self.bg_remove_ml(image)
+            elif self.method == 11:  # New Detectron2 method
+                confidence = params.get('detectron_confidence', 0.7)
+                self.log_message.emit(f"Using Detectron2 with confidence: {confidence}")
+                result = self.bg_remove_detectron2(image, confidence)  # Make sure this matches the actual method name
+            
             else:
                 result = self.bg_remove_method2(image)  # Default to method 2
             
@@ -212,13 +268,17 @@ class BackgroundRemover(QThread):
             self.log_message.emit(f"Traceback: {tb}")
             return False
     
-    def bg_remove_method1(self, image):
+    def bg_remove_method1(self, image, clahe_clip=4.0, block_size=15, c_constant=2, dilate_iterations=1):
         """
         Background removal using adaptive thresholding with preprocessing
-        optimized for cuneiform tablets against light backgrounds
+        optimized for cuneiform tablets against dark backgrounds
         
         Args:
             image (ndarray): Input image
+            clahe_clip (float): CLAHE clip limit for contrast enhancement
+            block_size (int): Block size for adaptive thresholding
+            c_constant (int): Constant subtracted from mean in thresholding
+            dilate_iterations (int): Number of dilation iterations for final mask
         
         Returns:
             ndarray: Image with background removed (white background)
@@ -227,65 +287,73 @@ class BackgroundRemover(QThread):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         # Apply CLAHE for local contrast enhancement
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
+        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
         
         # Apply bilateral filter to reduce noise while preserving edges
-        blurred = cv2.bilateralFilter(gray, 9, 75, 75)
+        blurred = cv2.bilateralFilter(enhanced, 7, 50, 50)
         
-        # Adaptive thresholding - works better than global threshold for uneven lighting
-        thresh = cv2.adaptiveThreshold(
+        # Two-stage thresholding process
+        _, rough_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Ensure block_size is odd
+        if block_size % 2 == 0:
+            block_size += 1
+            
+        adaptive_thresh = cv2.adaptiveThreshold(
             blurred, 
             255, 
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 
-            21,  # Larger block size for tablets
-            5    # Smaller constant for cleaner separation
+            block_size,
+            c_constant
         )
         
-        # Morphological operations to clean up the mask
-        kernel = np.ones((3,3), np.uint8)
-        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=3)
+        # Combine masks
+        combined_mask = cv2.bitwise_and(rough_mask, adaptive_thresh)
         
-        # Find contours to get the largest object (presumably the tablet)
+        # Morphological operations
+        kernel = np.ones((3,3), np.uint8)
+        cleaned = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Find contours
         contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         if contours:
-            # Get the largest contour
             largest_contour = max(contours, key=cv2.contourArea)
-            
-            # Create a mask from the largest contour
             mask = np.zeros_like(gray)
             cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
             
-            # Smooth the mask edges
-            mask = cv2.GaussianBlur(mask, (5,5), 0)
-            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+            # Dilate based on parameter
+            dilate_kernel = np.ones((3,3), np.uint8)
+            mask = cv2.dilate(mask, dilate_kernel, iterations=dilate_iterations)
         else:
-            # Fallback to the cleaned threshold if no contours found
             mask = cleaned
         
         # Create white background
         white_bg = np.ones_like(image) * 255
         
-        # Apply mask to extract foreground
+        # Extract foreground and background
         foreground = cv2.bitwise_and(image, image, mask=mask)
-        
-        # Invert mask for background
         bg_mask = cv2.bitwise_not(mask)
         background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
         
-        # Combine foreground and background
+        # Combine
         result = cv2.add(foreground, background)
         
         return result
 
-    def bg_remove_method2(self, image):
+    def bg_remove_method2(self, image, block_size=15, c_constant=2, pre_blur=5, post_blur=0):
         """
-        Improved background remover method 2 using adaptive thresholding
+        Improved background remover method 2 for cuneiform tablets against dark backgrounds
         
         Args:
             image (ndarray): Input image
+            block_size (int): Block size for adaptive threshold
+            c_constant (int): Constant subtracted from mean
+            pre_blur (int): Gaussian blur kernel size before thresholding (0 to disable)
+            post_blur (int): Gaussian blur kernel size for final mask (0 to disable)
         
         Returns:
             ndarray: Image with background removed
@@ -293,18 +361,29 @@ class BackgroundRemover(QThread):
         # Convert to Grayscale
         image_grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Apply some blurring to reduce noise
-        image_grey = cv2.GaussianBlur(image_grey, (5, 5), 0)
+        # Apply CLAHE for contrast enhancement
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        image_grey = clahe.apply(image_grey)
+        
+        # Apply pre-processing blur if specified
+        if pre_blur > 0:
+            # Ensure kernel size is odd
+            if pre_blur % 2 == 0:
+                pre_blur += 1
+            image_grey = cv2.GaussianBlur(image_grey, (pre_blur, pre_blur), 0)
 
-        # Use adaptive thresholding instead of fixed value
-        # This works better across different lighting conditions
+        # Make sure block_size is odd
+        if block_size % 2 == 0:
+            block_size += 1
+            
+        # Use adaptive thresholding with customizable parameters
         mask = cv2.adaptiveThreshold(
             image_grey, 
             255, 
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 
-            11,  # Block size
-            2    # Constant subtracted from mean
+            block_size,
+            c_constant
         )
         
         # Clean up the mask with morphological operations
@@ -312,14 +391,38 @@ class BackgroundRemover(QThread):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         
+        # Find contours to get complete tablet shape
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # If contours found, use the largest one as mask
+        if contours and len(contours) > 0:
+            # Get the largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # Create a filled contour mask
+            contour_mask = np.zeros_like(image_grey)
+            cv2.drawContours(contour_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+            
+            # Combine with original mask to get both the outline and internal details
+            final_mask = cv2.bitwise_or(mask, contour_mask)
+        else:
+            final_mask = mask
+        
+        # Apply post-blur to smooth mask edges if specified
+        if post_blur > 0:
+            if post_blur % 2 == 0:
+                post_blur += 1
+            final_mask = cv2.GaussianBlur(final_mask, (post_blur, post_blur), 0)
+            _, final_mask = cv2.threshold(final_mask, 127, 255, cv2.THRESH_BINARY)
+        
         # Create white background
         white_bg = np.ones_like(image) * 255
         
         # Apply mask to extract foreground
-        foreground = cv2.bitwise_and(image, image, mask=mask)
+        foreground = cv2.bitwise_and(image, image, mask=final_mask)
         
         # Invert mask for background
-        bg_mask = cv2.bitwise_not(mask)
+        bg_mask = cv2.bitwise_not(final_mask)
         background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
         
         # Combine foreground and background
@@ -327,62 +430,113 @@ class BackgroundRemover(QThread):
         
         return final_image
 
-    def bg_remove_method3(self, image):
+    def bg_remove_method3(self, image, s_threshold=30, v_threshold=30, 
+                          morph_open_size=3, morph_close_size=5, 
+                          min_contour_area=0.1, max_stray_area=0.01,
+                          feather_type='gaussian', feather_amount=5,
+                          debug=False, debug_output_folder=None):
         """
-        Improved background remover method 3 using HSV color space
+        Enhanced background remover with feathering options for smooth edges
         
         Args:
-            image (ndarray): Input image
-        
+            image (ndarray): Input image (BGR format)
+            s_threshold (int): Saturation threshold (0-255)
+            v_threshold (int): Value threshold (0-255)
+            morph_open_size (int): Kernel size for opening operation
+            morph_close_size (int): Kernel size for closing operation
+            min_contour_area (float): Minimum contour area as fraction of image area
+            max_stray_area (float): Maximum area for stray pixels (as fraction)
+            feather_type (str): Type of feathering ('gaussian', 'bilateral', 'morph')
+            feather_amount (int): Strength of feathering (1-20)
+            debug (bool): Whether to save intermediate images
+            debug_output_folder (str): Folder to save debug images
+            
         Returns:
-            ndarray: Image with background removed
+            ndarray: Image with background removed (white background)
         """
-        # Convert to HSV color space
-        image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
-        # Get individual channels
-        h, s, v = cv2.split(image_hsv)
-        
-        # Dynamically determine thresholds based on image content
-        # Calculate the mean of saturation and value channels
-        s_mean = np.mean(s)
-        v_mean = np.mean(v)
-        
-        # Set thresholds relative to the mean values
-        s_threshold = max(20, s_mean * 0.5)  # At least 20, or half the mean
-        v_threshold = max(20, v_mean * 0.5)  # At least 20, or half the mean
-        
-        # Create binary masks for saturation and value
-        s_mask = np.where(s > s_threshold, 255, 0).astype(np.uint8)
-        v_mask = np.where(v > v_threshold, 255, 0).astype(np.uint8)
-        
-        # Combine masks
-        combined_mask = cv2.bitwise_or(s_mask, v_mask)
-        
-        # Clean up the mask with morphological operations
-        kernel = np.ones((5, 5), np.uint8)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # Create white background
-        white_bg = np.ones_like(image) * 255
-        
-        # Apply mask to extract foreground
-        foreground = cv2.bitwise_and(image, image, mask=combined_mask)
-        
-        # Invert mask for background
-        bg_mask = cv2.bitwise_not(combined_mask)
-        background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
-        
-        # Combine foreground and background
-        final_image = cv2.add(foreground, background)
-        
-        return final_image
+        try:
+            if debug and debug_output_folder:
+                os.makedirs(debug_output_folder, exist_ok=True)
+            
+            # Convert to HSV and create initial mask (existing code)
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            h, s, v = cv2.split(hsv)
+            img_area = image.shape[0] * image.shape[1]
+            
+            s_mask = (s > s_threshold).astype(np.uint8) * 255
+            v_mask = (v > v_threshold).astype(np.uint8) * 255
+            combined_mask = cv2.bitwise_or(s_mask, v_mask)
+            
+            # Morphological operations (existing code)
+            kernel_open = np.ones((morph_open_size, morph_open_size), np.uint8)
+            cleaned = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+            kernel_close = np.ones((morph_close_size, morph_close_size), np.uint8)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+            
+            # Find contours and create final mask (existing code)
+            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            final_mask = np.zeros_like(cleaned)
+            
+            if contours:
+                filtered_contours = [cnt for cnt in contours 
+                                   if cv2.contourArea(cnt) > (max_stray_area * img_area)]
+                
+                if filtered_contours:
+                    largest_contour = max(filtered_contours, key=cv2.contourArea)
+                    cv2.drawContours(final_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+                    
+                    # ===== NEW FEATHERING CODE =====
+                    # Convert mask to float for smooth operations
+                    final_mask_float = final_mask.astype(np.float32) / 255.0
+                    
+                    if feather_type == 'gaussian':
+                        # Gaussian blur feathering
+                        kernel_size = feather_amount * 2 + 1  # Ensure odd number
+                        blurred_mask = cv2.GaussianBlur(final_mask_float, 
+                                                      (kernel_size, kernel_size), 
+                                                      feather_amount)
+                    
+                    elif feather_type == 'bilateral':
+                        # Bilateral filter preserves edges better
+                        blurred_mask = cv2.bilateralFilter(final_mask_float, 
+                                                         d=feather_amount * 2 + 1,
+                                                         sigmaColor=feather_amount * 10,
+                                                         sigmaSpace=feather_amount * 5)
+                    
+                    elif feather_type == 'morph':
+                        # Morphological gradient feathering
+                        kernel = np.ones((feather_amount, feather_amount), np.uint8)
+                        dilated = cv2.dilate(final_mask_float, kernel, iterations=1)
+                        eroded = cv2.erode(final_mask_float, kernel, iterations=1)
+                        gradient = dilated - eroded
+                        blurred_mask = final_mask_float + (gradient * 0.5)
+                    
+                    # Ensure values stay in 0-1 range
+                    blurred_mask = np.clip(blurred_mask, 0, 1)
+                    
+                    # Convert back to 8-bit mask
+                    final_mask = (blurred_mask * 255).astype(np.uint8)
+                    # ===== END FEATHERING CODE =====
+                    
+                    if debug and debug_output_folder:
+                        cv2.imwrite(f"{debug_output_folder}/6_feathered_mask.png", final_mask)
+            
+            # Create white background and apply mask
+            white_bg = np.ones_like(image) * 255
+            foreground = cv2.bitwise_and(image, image, mask=final_mask)
+            bg_mask = cv2.bitwise_not(final_mask)
+            background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
+            result = cv2.add(foreground, background)
+            
+            return result
+            
+        except Exception as e:
+            self.log_message.emit(f"Error in method3 with feathering: {str(e)}")
+            return self.bg_remove_method2(image)
     
     def bg_remove_method4(self, image, block_size=11, c_constant=2):
         """
-        Remove black background from an image. Works better when
-        objects are photographed against a dark/black background.
+        Improved method for removing black background from cuneiform tablets
         
         Args:
             image (ndarray): Input image with black background
@@ -392,34 +546,57 @@ class BackgroundRemover(QThread):
         Returns:
             ndarray: Image with background replaced by white
         """
-        # Method implementation with parameters
+        # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Use adaptive thresholding to handle varying lighting
-        # This works better than global thresholding for uneven backgrounds
+        # Apply CLAHE to enhance contrast
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        # Apply bilateral filter to reduce noise while preserving edges
+        blurred = cv2.bilateralFilter(enhanced, 9, 75, 75)
+        
+        # Apply adaptive thresholding with adjusted parameters
+        # The key is to use a small C value for dark objects on dark backgrounds
         binary = cv2.adaptiveThreshold(
-            gray, 
+            blurred, 
             255, 
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
             cv2.THRESH_BINARY_INV, 
-            block_size,  # Now uses parameter
-            c_constant   # Now uses parameter
+            max(3, (block_size if block_size % 2 == 1 else block_size + 1)),  # Ensure odd value
+            max(1, c_constant - 1)  # Use smaller C value for better detection
         )
         
         # Clean up the mask - remove noise
         kernel = np.ones((3, 3), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)  # More closing to fill in gaps
+        
+        # Find contours to find the full tablet shape
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Create a new mask from the largest contour (should be the tablet)
+        mask = np.zeros_like(gray)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            cv2.drawContours(mask, [largest_contour], 0, 255, thickness=cv2.FILLED)
+            
+            # Dilate the mask slightly to ensure we get the entire tablet
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        else:
+            # If no contour found, fall back to the binary threshold
+            mask = binary
         
         # Create white background
         white_bg = np.ones_like(image) * 255
         
         # Apply mask to extract foreground
-        foreground = cv2.bitwise_and(image, image, mask=binary)
+        foreground = cv2.bitwise_and(image, image, mask=mask)
         
         # Invert mask for background
-        background_mask = cv2.bitwise_not(binary)
-        background = cv2.bitwise_and(white_bg, white_bg, mask=background_mask)
+        bg_mask = cv2.bitwise_not(mask)
+        background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
         
         # Combine foreground and background
         result = cv2.add(foreground, background)
@@ -478,215 +655,28 @@ class BackgroundRemover(QThread):
         
         return result
 
-    def bg_remove_method6(self, image, k=2, bg_detection_mode='darkest'):
+           
+    def bg_remove_rembg(self, image, model_name='u2net', alpha_matting=True, 
+                                alpha_matting_foreground_threshold=240,
+                                alpha_matting_background_threshold=10,
+                                alpha_matting_erode_size=10):
         """
-        Background remover method 6 using k-means clustering
-        
-        Args:
-            image (ndarray): Input image
-            k (int): Number of clusters for k-means (default: 2)
-            bg_detection_mode (str): How to identify background cluster
-                                    'darkest' - assumes darkest cluster is background
-                                    'brightest' - assumes brightest cluster is background
-                                    'largest' - assumes largest cluster is background
-        
-        Returns:
-            ndarray: Image with background removed
-        """
-        # Reshape image
-        pixels = image.reshape((-1, 3))
-        pixels = np.float32(pixels)
-        
-        # Define criteria and apply kmeans
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-        _, labels, centers = cv2.kmeans(pixels, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-        
-        # Convert back to uint8
-        centers = np.uint8(centers)
-        segmented = centers[labels.flatten()]
-        segmented = segmented.reshape(image.shape)
-        
-        # Find which cluster is the background based on selected mode
-        if bg_detection_mode == 'darkest':
-            # Find darkest cluster (lowest average intensity)
-            avg_colors = np.mean(centers, axis=1)
-            bg_cluster = np.argmin(avg_colors)
-        elif bg_detection_mode == 'brightest':
-            # Find brightest cluster (highest average intensity)
-            avg_colors = np.mean(centers, axis=1)
-            bg_cluster = np.argmax(avg_colors)
-        elif bg_detection_mode == 'largest':
-            # Find the largest cluster (most pixels)
-            cluster_sizes = np.bincount(labels.flatten())
-            bg_cluster = np.argmax(cluster_sizes)
-        else:
-            # Default to darkest
-            avg_colors = np.mean(centers, axis=1)
-            bg_cluster = np.argmin(avg_colors)
-        
-        # Create mask - 0 for background cluster, 255 for others
-        mask = np.ones(labels.shape, np.uint8) * 255
-        mask[labels.flatten() == bg_cluster] = 0
-        mask = mask.reshape(image.shape[0], image.shape[1])
-        
-        # Create white background
-        white_bg = np.ones_like(image) * 255
-        
-        # Apply mask
-        foreground = cv2.bitwise_and(image, image, mask=mask)
-        bg_mask = cv2.bitwise_not(mask)
-        background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
-        
-        # Combine
-        result = cv2.add(foreground, background)
-        
-        return result
-    
-    def bg_remove_method7(self, image, clahe_clip=4.0, edge_sensitivity=3, iterations=10):
-        """
-        GrabCut optimized specifically for cuneiform tablets against dark backgrounds
-        """
-        # Create initial mask
-        mask = np.zeros(image.shape[:2], np.uint8)
-        
-        # Map edge sensitivity to appropriate thresholds
-        edge_thresholds = {
-            1: (30, 120),  # Less sensitive
-            2: (25, 110),
-            3: (20, 100),  # Default
-            4: (15, 75),
-            5: (10, 50)    # More sensitive
-        }
-        low_thresh, high_thresh = edge_thresholds.get(edge_sensitivity, (20, 100))
-        
-        # Convert to grayscale and enhance contrast based on parameter
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        
-        # Try various preprocessing to improve edge detection
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Lower thresholds for Canny to detect more edges based on sensitivity
-        edges = cv2.Canny(blurred, low_thresh, high_thresh)
-        
-        # More aggressive dilation to connect edges
-        kernel = np.ones((7,7), np.uint8)  # Larger kernel
-        dilated = cv2.dilate(edges, kernel, iterations=4)  # More iterations
-        
-        # Find contours 
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Define variables needed for GrabCut
-        bgd_model = np.zeros((1, 65), np.float64)
-        fgd_model = np.zeros((1, 65), np.float64)
-        
-        # Default rectangle in case none is found
-        h, w = image.shape[:2]
-        rect = (int(w*0.1), int(h*0.1), int(w*0.8), int(h*0.8))
-        
-        # If no significant contours found, try with even lower thresholds
-        if not contours or max((cv2.contourArea(c) for c in contours), default=0) < (image.shape[0] * image.shape[1] * 0.05):
-            edges = cv2.Canny(gray, low_thresh/2, high_thresh/2)  # Even lower thresholds
-            dilated = cv2.dilate(edges, kernel, iterations=5)
-            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # If contours are found, use them to create mask
-        if contours and max((cv2.contourArea(c) for c in contours), default=0) > (image.shape[0] * image.shape[1] * 0.01):
-            # Find largest contour by area
-            largest_contour = max(contours, key=cv2.contourArea)
-            
-            # Get bounding rectangle with generous margin
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            margin_x = int(w * 15 / 100)
-            margin_y = int(h * 15 / 100)
-            x = max(0, x - margin_x)
-            y = max(0, y - margin_y)
-            w = min(image.shape[1] - x, w + 2*margin_x)
-            h = min(image.shape[0] - y, h + 2*margin_y)
-            rect = (x, y, w, h)
-            
-            # More nuanced initialization
-            # Definitely foreground: interior of contour
-            cv2.drawContours(mask, [largest_contour], 0, cv2.GC_FGD, -1)
-            
-            # Probable foreground: area around contour
-            dilated_contour = cv2.dilate(np.zeros_like(gray), kernel, iterations=2)
-            cv2.drawContours(dilated_contour, [largest_contour], 0, 255, -1)
-            mask[dilated_contour == 255] = cv2.GC_PR_FGD
-            
-            # Rest is background
-            mask[mask == 0] = cv2.GC_BGD
-        else:
-            # If no contours or too small, try intensity-based approach
-            _, intensity_mask = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
-            kernel = np.ones((5,5), np.uint8)
-            intensity_mask = cv2.morphologyEx(intensity_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-            
-            # Find contours in the intensity mask
-            intensity_contours, _ = cv2.findContours(intensity_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if intensity_contours and any(cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.01) for c in intensity_contours):
-                largest_contour = max(intensity_contours, key=cv2.contourArea)
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                rect = (x, y, w, h)
-                
-                # Initialize mask: probable foreground for contour interior
-                cv2.drawContours(mask, [largest_contour], 0, cv2.GC_PR_FGD, -1)
-                
-                # Mark rest as background
-                mask[mask == 0] = cv2.GC_BGD
-            else:
-                # Final fallback - use center with larger margin
-                h, w = image.shape[:2]
-                margin_x = int(w * 25 / 100)  # Larger margin
-                margin_y = int(h * 25 / 100)
-                rect = (margin_x, margin_y, w - 2*margin_x, h - 2*margin_y)
-                
-                # Initialize with rectangle
-                mask[rect[1]:rect[1]+rect[3], rect[0]:rect[0]+rect[2]] = cv2.GC_PR_FGD
-                mask[mask == 0] = cv2.GC_BGD
-        
-        # Apply GrabCut with more iterations for better results
-        try:
-            cv2.grabCut(image, mask, rect, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_MASK)
-        except Exception as e:
-            self.log_message.emit(f"GrabCut error: {str(e)}, falling back to simpler method")
-            # Fallback
-            mask = np.zeros(image.shape[:2], np.uint8)
-            mask[rect[1]:rect[1]+rect[3], rect[0]:rect[0]+rect[2]] = 1
-        
-        # Create mask (both definite and probable foreground)
-        mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-        
-        # Refine edges with morphological operations
-        kernel = np.ones((3, 3), np.uint8)
-        mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel, iterations=3)
-        
-        # Sometimes artifacts remain at the edges - clean them up
-        mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # Create output image
-        foreground = cv2.bitwise_and(image, image, mask=mask2)
-        background = np.ones_like(image, np.uint8) * 255
-        background = cv2.bitwise_and(background, background, mask=cv2.bitwise_not(mask2))
-        result = cv2.add(foreground, background)
-        
-        return result           
-    def bg_remove_rembg(self, image):
-        """
-        Background remover using Rembg library with U²-Net
-        Excellent for objects against uniform backgrounds
+        Enhanced Rembg background remover with configurable parameters
         
         Args:
             image (ndarray): Input image (BGR format from OpenCV)
+            model_name (str): Model to use ('u2net', 'u2netp', 'u2net_human_seg', 'silueta')
+            alpha_matting (bool): Whether to use alpha matting
+            alpha_matting_foreground_threshold (int): Alpha matting foreground threshold
+            alpha_matting_background_threshold (int): Alpha matting background threshold
+            alpha_matting_erode_size (int): Alpha matting erode size
         
         Returns:
             ndarray: Image with background removed (white background)
         """
         try:
-            # Import rembg (you'll need to install with pip install rembg)
-            from rembg import remove
+            # Import rembg
+            from rembg import remove, new_session
             import PIL.Image as PILImage
             from io import BytesIO
             
@@ -694,8 +684,19 @@ class BackgroundRemover(QThread):
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             pil_image = PILImage.fromarray(image_rgb)
             
-            # Process with rembg
-            output_pil = remove(pil_image)
+            # Create session with specific model
+            session = new_session(model_name)
+            
+            # Process with rembg using custom parameters
+            # For dark/black backgrounds, lower the alpha_matting_background_threshold
+            output_pil = remove(
+                pil_image,
+                session=session,
+                alpha_matting=alpha_matting,
+                alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+                alpha_matting_background_threshold=alpha_matting_background_threshold,
+                alpha_matting_erode_size=alpha_matting_erode_size
+            )
             
             # Extract alpha channel and create white background
             alpha = output_pil.split()[-1]
@@ -708,30 +709,34 @@ class BackgroundRemover(QThread):
             return result
         except ImportError:
             self.log_message.emit("Rembg library not installed. Install with 'pip install rembg'")
-            # Fall back to method 6 which works well for this type of image
             return self.bg_remove_method6(image, k=2, bg_detection_mode='darkest')
     
     def bg_remove_ml(self, image):
         """
-        Background remover using a pre-trained U-Net or DeepLabV3 model
-        specifically fine-tuned for archaeological artifacts
-        
-        Args:
-            image (ndarray): Input image
-        
-        Returns:
-            ndarray: Image with background removed
+        Background remover using a pre-trained DeepLabV3 model with enhanced debugging
         """
         try:
             # Import necessary libraries
             import torch
+            import torch.nn.functional as F
             from torchvision import transforms
+            import matplotlib.pyplot as plt
+            import os
+            
+            # Create debug directory
+            debug_dir = os.path.join(self.output_path, "debug_ml")
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            self.log_message.emit(f"Starting ML-based segmentation with debugging to {debug_dir}")
+            
+            # Save original image for debugging
+            cv2.imwrite(os.path.join(debug_dir, "01_original.jpg"), image)
             
             # Check if we can use GPU
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.log_message.emit(f"Using device: {device}")
             
-            # Load pre-trained model (you would need to train this or find one)
-            # This is a placeholder - you'd need to implement the actual model loading
+            # Load pre-trained model
             model = torch.hub.load('pytorch/vision', 'deeplabv3_resnet101', weights=True)
             model.to(device)
             model.eval()
@@ -745,163 +750,241 @@ class BackgroundRemover(QThread):
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
             input_tensor = preprocess(input_image)
+            
+            # Save resized input for debugging
+            resized_np = input_tensor.permute(1, 2, 0).numpy() * 255
+            cv2.imwrite(os.path.join(debug_dir, "02_resized_input.jpg"), cv2.cvtColor(resized_np.astype(np.uint8), cv2.COLOR_RGB2BGR))
+            
             input_batch = input_tensor.unsqueeze(0).to(device)
             
             # Get prediction
+            self.log_message.emit("Running model inference...")
             with torch.no_grad():
                 output = model(input_batch)['out'][0]
-            output_predictions = output.argmax(0).byte().cpu().numpy()
             
-            # Resize mask back to original image size
-            mask = cv2.resize(output_predictions, (image.shape[1], image.shape[0]), 
-                              interpolation=cv2.INTER_NEAREST)
+            self.log_message.emit("Model inference complete")
             
-            # Create foreground mask (assuming class 15 is the object class for DeepLabV3)
-            # You would need to adjust this based on your model's output
-            foreground_mask = (mask == 15).astype(np.uint8) * 255
+            # Get probabilities
+            probabilities = F.softmax(output, dim=0).cpu().numpy()
+            
+            # Get class predictions
+            predictions = output.argmax(0).byte().cpu().numpy()
+            
+            # Save prediction visualization for debugging
+            plt.figure(figsize=(10, 10))
+            plt.imshow(predictions)
+            plt.colorbar()
+            plt.title("Class Predictions")
+            plt.savefig(os.path.join(debug_dir, "03_class_predictions.png"))
+            plt.close()
+            
+            # Log unique classes and their counts
+            unique_classes, counts = np.unique(predictions, return_counts=True)
+            self.log_message.emit(f"Classes found: {list(zip(unique_classes, counts))}")
+            
+            # Try more potential classes, including some that might remotely resemble tablets
+            potential_classes = [1, 2, 3, 7, 13, 14, 15, 18, 19, 20, 44, 45, 62, 67, 73, 77, 84]
+
+            # Lower the minimum pixel count to accept a class
+            if class_pixels > 50:  # Lower from current value
+                self.log_message.emit(f"Class {class_id} has {class_pixels} pixels")
+                mask = np.logical_or(mask, class_mask)
+                classes_used.append(class_id)
+            
+            # Create a combined mask
+            mask = np.zeros_like(predictions, dtype=np.uint8)
+            classes_used = []
+            
+            for class_id in potential_classes:
+                if class_id in unique_classes:
+                    class_mask = predictions == class_id
+                    class_pixels = np.sum(class_mask)
+                    
+                    if class_pixels > 0:
+                        self.log_message.emit(f"Class {class_id} has {class_pixels} pixels")
+                        mask = np.logical_or(mask, class_mask)
+                        classes_used.append(class_id)
+                        
+                        # Save individual class masks for debugging
+                        class_mask_vis = class_mask.astype(np.uint8) * 255
+                        cv2.imwrite(os.path.join(debug_dir, f"04_class_{class_id}_mask.png"), class_mask_vis)
+            
+            # If no classes matched, use the largest non-background class
+            if not classes_used and len(unique_classes) > 1:
+                # Usually class 0 is background
+                non_bg_classes = [(c, counts[i]) for i, c in enumerate(unique_classes) if c > 0]
+                
+                if non_bg_classes:
+                    # Sort by count (descending)
+                    non_bg_classes.sort(key=lambda x: x[1], reverse=True)
+                    largest_class = non_bg_classes[0][0]
+                    
+                    self.log_message.emit(f"No tablet classes matched. Using largest non-background class: {largest_class}")
+                    mask = predictions == largest_class
+                    classes_used.append(largest_class)
+            
+            # If still no mask, fallback to traditional method
+            if not classes_used:
+                self.log_message.emit("No suitable classes found. Falling back to traditional method.")
+                
+                # Save an empty mask for debugging
+                empty_mask = np.zeros_like(predictions, dtype=np.uint8)
+                cv2.imwrite(os.path.join(debug_dir, "05_empty_mask.png"), empty_mask)
+                
+                return self.bg_remove_method2(image)
+            
+            # Create binary mask
+            binary_mask = mask.astype(np.uint8) * 255
+            
+            # Save the combined mask for debugging
+            cv2.imwrite(os.path.join(debug_dir, "06_combined_mask.png"), binary_mask)
+            
+            # Resize mask to original size
+            h, w = image.shape[:2]
+            resized_mask = cv2.resize(binary_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            
+            # Save the resized mask for debugging
+            cv2.imwrite(os.path.join(debug_dir, "07_resized_mask.png"), resized_mask)
+            
+            # Clean up mask with morphological operations
+            kernel = np.ones((5, 5), np.uint8)
+            cleaned_mask = cv2.morphologyEx(resized_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            
+            # Save the cleaned mask for debugging
+            cv2.imwrite(os.path.join(debug_dir, "08_cleaned_mask.png"), cleaned_mask)
             
             # Create white background
             white_bg = np.ones_like(image) * 255
             
             # Apply mask to extract foreground
-            foreground = cv2.bitwise_and(image, image, mask=foreground_mask)
+            foreground = cv2.bitwise_and(image, image, mask=cleaned_mask)
+            
+            # Save the foreground for debugging
+            cv2.imwrite(os.path.join(debug_dir, "09_foreground.jpg"), foreground)
             
             # Invert mask for background
-            bg_mask = cv2.bitwise_not(foreground_mask)
+            bg_mask = cv2.bitwise_not(cleaned_mask)
+            
+            # Save the background mask for debugging
+            cv2.imwrite(os.path.join(debug_dir, "10_bg_mask.png"), bg_mask)
+            
             background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
+            
+            # Save the background for debugging
+            cv2.imwrite(os.path.join(debug_dir, "11_background.jpg"), background)
             
             # Combine foreground and background
             result = cv2.add(foreground, background)
             
+            # Save the final result for debugging
+            cv2.imwrite(os.path.join(debug_dir, "12_final_result.jpg"), result)
+            
+            self.log_message.emit(f"ML processing complete using classes: {classes_used}")
+            
             return result
         
-        except ImportError:
-            self.log_message.emit("Required ML libraries not installed. Falling back to Otsu+Contour method.")
-            return self.bg_remove_otsu_contour(image)
+        except Exception as e:
+            self.log_message.emit(f"ML processing failed: {str(e)}")
+            self.log_message.emit(traceback.format_exc())
+            return self.bg_remove_method2(image)
         
-    def bg_remove_otsu_contour(self, image):
+    def bg_remove_detectron2(self, image, confidence=0.7, class_ids=None, transparent_bg=False):
         """
-        Background remover optimized for clay tablets against dark backgrounds
-        using Otsu thresholding combined with contour refinement
-        
-        Args:
-            image (ndarray): Input image
-        
+        Remove background using Detectron2's Mask R-CNN"""
+        self.log_message.emit(f"Detectron2 received confidence parameter: {confidence}")
+        """Args:
+            image: Input image (BGR)
+            confidence: Detection confidence threshold
+            class_ids: List of COCO class IDs to consider (None = all)
+            transparent_bg: Whether to create transparent background
+            
         Returns:
-            ndarray: Image with background removed
+            Image with background removed
         """
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply bilateral filter to smooth the image while preserving edges
-        blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-        
-        # Apply Otsu's thresholding
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Morphological operations to clean up the mask
-        kernel = np.ones((5, 5), np.uint8)
-        opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-        sure_bg = cv2.dilate(opening, kernel, iterations=3)
-        
-        # Distance transform to find sure foreground
-        dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
-        _, sure_fg = cv2.threshold(dist_transform, 0.3*dist_transform.max(), 255, 0)
-        sure_fg = sure_fg.astype(np.uint8)
-        
-        # Find unknown region
-        unknown = cv2.subtract(sure_bg, sure_fg)
-        
-        # Marker labelling
-        _, markers = cv2.connectedComponents(sure_fg)
-        markers = markers + 1
-        markers[unknown==255] = 0
-        
-        # Apply watershed algorithm
-        markers = cv2.watershed(image, markers)
-        
-        # Create mask - mark region of interest with white
-        mask = np.zeros_like(gray, dtype=np.uint8)
-        mask[markers > 1] = 255
-        
-        # Find contours on the mask
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Select the largest contour
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
+        if not DETECTRON2_AVAILABLE:
+            self.log_message.emit("Detectron2 is not installed. Falling back to method 5.")
+            return self.bg_remove_method5(image)
             
-            # Create a new mask with only the largest contour
-            refined_mask = np.zeros_like(gray, dtype=np.uint8)
-            cv2.drawContours(refined_mask, [largest_contour], 0, 255, -1)
+        try:
+            # Initialize configuration
+            cfg = get_cfg()
+            cfg.merge_from_file(model_zoo.get_config_file(
+                "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
+            cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
+                "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+            cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = confidence
+            cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
             
-            # Apply a final dilation to ensure we capture the entire object
-            refined_mask = cv2.dilate(refined_mask, kernel, iterations=2)
-        else:
-            refined_mask = mask
-        
-        # Create white background
-        white_bg = np.ones_like(image) * 255
-        
-        # Apply mask to extract foreground
-        foreground = cv2.bitwise_and(image, image, mask=refined_mask)
-        
-        # Invert mask for background
-        bg_mask = cv2.bitwise_not(refined_mask)
-        background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
-        
-        # Combine foreground and background
-        result = cv2.add(foreground, background)
-        
-        return result
-        
-        # def create_transparent_background(self, input_path, output_path):
-        #     try:
-        #         # Read the image
-        #         image = cv2.imread(input_path)
-                
-        #         # Get alpha channel (foreground mask)
-        #         if self.method == 1:
-        #             result = self.bg_remove_method1(image)
-        #         elif self.method == 2:
-        #             result = self.bg_remove_method2(image)
-        #         elif self.method == 3:
-        #             result = self.bg_remove_method3(image)
-        #         elif self.method == 4:
-        #             result = self.bg_remove_method4(image)
-        #         elif self.method == 5:
-        #             result = self.bg_remove_method5(image)
-        #         elif self.method == 6:
-        #             result = self.bg_remove_method6(image)
-        #         elif self.method == 7:
-        #             result = self.bg_remove_method7(image)
-        #         elif self.method == 8:
-        #         # Neural network-based approach
-        #             result = self.bg_remove_rembg(image)
-        #         else:
-        #             result = self.bg_remove_method2(image)  # Default to method 2
-                
-        #         # Convert to grayscale and threshold
-        #         gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-        #         _, alpha = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
-                
-        #         # Convert to PIL Image
-        #         b, g, r = cv2.split(image)
-        #         img_rgba = Image.merge('RGBA', (
-        #             Image.fromarray(r),
-        #             Image.fromarray(g),
-        #             Image.fromarray(b),
-        #             Image.fromarray(alpha)
-        #         ))
-                
-        #         # Save with transparency
-        #         img_rgba.save(output_path, format='PNG')
-        #         self.log_message.emit(f"Saved transparent background image: {output_path}")
-                
-        #         return True
+            # Log which device we're using
+            self.log_message.emit(f"Using Detectron2 on {cfg.MODEL.DEVICE}")
             
-        #     except Exception as e:
-        #         self.log_message.emit(f"Error creating transparent background: {str(e)}")
-        #         tb = traceback.format_exc()
-        #         self.log_message.emit(f"Traceback: {tb}")
-        #         return False
+            # Process image
+            predictor = DefaultPredictor(cfg)
+            outputs = predictor(image)
+            
+            # Get instances
+            instances = outputs["instances"].to("cpu")
+            if len(instances) == 0:
+                self.log_message.emit("No objects detected. Falling back to method 5.")
+                return self.bg_remove_method5(image)
+                
+            # Get predictions
+            pred_classes = instances.pred_classes.numpy()
+            pred_scores = instances.scores.numpy()
+            pred_masks = instances.pred_masks.numpy()
+            
+            # Filter by class if specified
+            if class_ids is not None:
+                class_indices = [i for i, cls in enumerate(pred_classes) if cls in class_ids]
+                if not class_indices:
+                    self.log_message.emit(f"No objects of specified classes found. Detected classes: {np.unique(pred_classes)}")
+                    return self.bg_remove_method5(image)
+                    
+                # Filter to only keep specified classes
+                filtered_scores = pred_scores[class_indices]
+                filtered_masks = pred_masks[class_indices]
+                
+                # Find best scoring instance
+                best_idx = np.argmax(filtered_scores)
+                best_mask = filtered_masks[best_idx]
+            else:
+                # No class filtering - use highest scoring instance
+                best_idx = np.argmax(pred_scores)
+                best_mask = pred_masks[best_idx]
+                best_class = pred_classes[best_idx]
+                best_score = pred_scores[best_idx]
+                
+                # Log what was detected
+                coco_classes = ["person", "bicycle", "car", ...]  # Full COCO class list would go here
+                self.log_message.emit(f"Detected {coco_classes[best_class]} with confidence {best_score:.2f}")
+            
+            # Convert mask to proper format for OpenCV
+            mask = (best_mask * 255).astype(np.uint8)
+            
+            # Refine mask with morphological operations
+            kernel = np.ones((5,5), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+            
+            # Apply mask to create output
+            if transparent_bg:
+                # Create transparent background
+                result = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+                result[:, :, 3] = mask
+            else:
+                # Create white background
+                white_bg = np.ones_like(image) * 255
+                foreground = cv2.bitwise_and(image, image, mask=mask)
+                bg_mask = cv2.bitwise_not(mask)
+                background = cv2.bitwise_and(white_bg, white_bg, mask=bg_mask)
+                result = cv2.add(foreground, background)
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Detectron2 processing failed: {str(e)}"
+            self.log_message.emit(error_msg)
+            self.log_message.emit(traceback.format_exc())
+            self.log_message.emit("Falling back to method 5")
+            return self.bg_remove_method5(image)
+        
+    

@@ -6,6 +6,9 @@ Main window implementation for the Cuneiform Tablet Processor application.
 import os
 import sys
 import traceback
+import cv2
+import numpy as np
+import torch
 
 # Update imports at the top of the main_window.py file:
 from PyQt5.QtWidgets import (QMainWindow, QTabWidget, QWidget, 
@@ -277,9 +280,7 @@ class MainWindow(QMainWindow):
         
         self.credit_input = QTextEdit()
         default_credit = (
-            "Funding for photography and post-processing provided by a Sofja Kovalevskaja Award "
-            "(Alexander von Humboldt Foundation, German Federal Ministry for Education and Research) "
-            "as part of the Electronic Babylonian Literature-Projekt of the Ludwig-Maximilians-Universität München"
+            ""
         )
         self.credit_input.setText(default_credit)
         self.credit_input.setMaximumHeight(100)
@@ -948,11 +949,9 @@ class MainWindow(QMainWindow):
             "Method 3 (HSV Space)",
             "Method 4 (Black Background)",
             "Method 5 (Edge Detection)",
-            "Method 6 (Color Clustering)",
-            "Method 7 (GrabCut - Auto)",
             "Method 8 (Neural Network)",
-            "Method 9 (Otsu Watershed)",
-            "Method 10 (U-Net or DeepLabV3)"
+            "Method 10 (U-Net or DeepLabV3)",
+            "Method 11 (Detectron2 - Photoshop-like)",
         ])
         self.bg_method_dropdown.setCurrentIndex(1)  # Default to Method 2
         method_layout.addWidget(self.bg_method_dropdown)
@@ -966,11 +965,7 @@ class MainWindow(QMainWindow):
         # Connect method dropdown to description updater
         self.bg_method_dropdown.currentIndexChanged.connect(self.update_bg_method_description)
         
-        # Transparent Background Option
-        transparent_layout = QHBoxLayout()
-        self.transparent_bg_checkbox = QCheckBox("Create transparent background (PNG)")
-        transparent_layout.addWidget(self.transparent_bg_checkbox)
-        bg_options_layout.addLayout(transparent_layout)
+        
         
         layout.addWidget(bg_options_group)
         
@@ -1059,22 +1054,32 @@ class MainWindow(QMainWindow):
                 
                 # Collect parameters
                 params = {}
-                if method == 4:  # Black Background
+                if method == 1:  # Method 1 (Gaussian + Otsu)
+                    params['clahe_clip'] = self.param_widgets.get('clahe_clip', QDoubleSpinBox()).value()
                     params['block_size'] = self.param_widgets.get('block_size', QSpinBox()).value()
                     params['c_constant'] = self.param_widgets.get('c_constant', QSpinBox()).value()
+                    params['dilate_iterations'] = self.param_widgets.get('dilate_iterations', QSpinBox()).value()
+                
+                elif method == 3:  # HSV Space
+                    params['s_threshold'] = self.param_widgets.get('s_threshold', QSpinBox()).value()
+                    params['v_threshold'] = self.param_widgets.get('v_threshold', QSpinBox()).value()
+                    params['morph_open_size'] = self.param_widgets.get('morph_open_size', QSpinBox()).value()
+                    params['morph_close_size'] = self.param_widgets.get('morph_close_size', QSpinBox()).value()
+                    params['min_contour_area'] = self.param_widgets.get('min_contour_area', QDoubleSpinBox()).value()
+                    params['debug'] = False  # Don't debug for preview
+                
+                elif method == 4:  # Black Background
+                    params['block_size'] = self.param_widgets.get('block_size', QSpinBox()).value()
+                    params['c_constant'] = self.param_widgets.get('c_constant', QSpinBox()).value()
+                
                 elif method == 5:  # Edge Detection
                     params['low_threshold'] = self.param_widgets.get('low_threshold', QSpinBox()).value()
                     params['high_threshold'] = self.param_widgets.get('high_threshold', QSpinBox()).value()
                     params['dilation_iterations'] = self.param_widgets.get('dilation_iterations', QSpinBox()).value()
-                elif method == 6:  # K-means
-                    params['k_clusters'] = self.param_widgets.get('k_clusters', QSpinBox()).value()
-                    mode_map = {0: 'darkest', 1: 'brightest', 2: 'largest'}
-                    mode_idx = self.param_widgets.get('bg_detection_mode', QComboBox()).currentIndex()
-                    params['bg_detection_mode'] = mode_map.get(mode_idx, 'darkest')
-                elif method == 7:  # GrabCut
-                    params['clahe_clip'] = self.param_widgets.get('clahe_clip', QDoubleSpinBox()).value()
-                    params['edge_sensitivity'] = self.param_widgets.get('edge_sensitivity', QSlider()).value()
-                    params['iterations'] = self.param_widgets.get('iterations', QSpinBox()).value()
+                
+                elif method == 11:  # Detectron2
+                    params['detectron_confidence'] = self.param_widgets.get('detectron_confidence', QDoubleSpinBox()).value()
+                
                 
                 # Create temporary file for processed image
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
@@ -1086,65 +1091,33 @@ class MainWindow(QMainWindow):
                     from processing.background_remover import BackgroundRemover
                     
                     image = cv2.imread(self.sample_image_path)
+                    if image is None:
+                        raise ValueError("Could not load image with OpenCV")
+                    
+                    # Initialize the BackgroundRemover with current settings
                     bg_remover = BackgroundRemover({
                         'bg_remove_method': method,
                         'params': params
                     })
                     
-                    if method == 1:
-                        result = bg_remover.bg_remove_method1(image)
-                    elif method == 2:
-                        result = bg_remover.bg_remove_method2(image)
-                    elif method == 3:
-                        result = bg_remover.bg_remove_method3(image)
-                    elif method == 4:
-                        result = bg_remover.bg_remove_method4(
-                            image, 
-                            params.get('block_size', 11), 
-                            params.get('c_constant', 2)
+                    # Call the remove_background method directly
+                    result = bg_remover.remove_background(self.sample_image_path, temp_output)
+                    
+                    if result:
+                        # Display the processed image
+                        processed_pixmap = QPixmap(temp_output)
+                        processed_pixmap = processed_pixmap.scaled(
+                            self.processed_preview.width(), 
+                            self.processed_preview.height(),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation
                         )
-                    elif method == 5:
-                        result = bg_remover.bg_remove_method5(
-                            image,
-                            params.get('low_threshold', 30),
-                            params.get('high_threshold', 100),
-                            params.get('dilation_iterations', 3)
-                        )
-                    elif method == 6:
-                        result = bg_remover.bg_remove_method6(
-                            image,
-                            params.get('k_clusters', 2),
-                            params.get('bg_detection_mode', 'darkest')
-                        )
-                    elif method == 7:
-                        result = bg_remover.bg_remove_method7(
-                            image,
-                            params.get('clahe_clip', 4.0),
-                            params.get('edge_sensitivity', 3),
-                            params.get('iterations', 10)
-                        )
-                    elif method == 8:
-                        result = bg_remover.bg_remove_rembg(image)
-                    elif method == 9:
-                        result = bg_remover.bg_remove_otsu_contour(image)
-                    elif method == 10:
-                        result = bg_remover.bg_remove_ml(image)
+                        self.processed_preview.setPixmap(processed_pixmap)
+                        
+                        # Clean up temp file after a delay
+                        QTimer.singleShot(1000, lambda: os.unlink(temp_output))
                     else:
-                        result = bg_remover.bg_remove_method2(image)  # Default
-                    
-                    # Save and display result
-                    cv2.imwrite(temp_output, result)
-                    processed_pixmap = QPixmap(temp_output)
-                    processed_pixmap = processed_pixmap.scaled(
-                        self.processed_preview.width(), 
-                        self.processed_preview.height(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
-                    )
-                    self.processed_preview.setPixmap(processed_pixmap)
-                    
-                    # Clean up temp file after a delay
-                    QTimer.singleShot(1000, lambda: os.unlink(temp_output))
+                        self.log_message("Error generating preview: background removal failed", error=True)
                     
                 except Exception as e:
                     self.log_message(f"Error generating preview: {str(e)}", error=True)
@@ -1174,7 +1147,135 @@ class MainWindow(QMainWindow):
         
         method_index = self.bg_method_dropdown.currentIndex() + 1  # 1-based
         
-        if method_index == 4:  # Black Background
+        if method_index == 1:  # Method 1 (Gaussian + Otsu)
+            clahe_spin = QDoubleSpinBox()
+            clahe_spin.setRange(1.0, 8.0)
+            clahe_spin.setSingleStep(0.5)
+            clahe_spin.setValue(4.0)
+            form_layout.addRow("CLAHE Clip Limit:", clahe_spin)
+            self.param_widgets['clahe_clip'] = clahe_spin
+            
+            block_spin = QSpinBox()
+            block_spin.setRange(3, 51)
+            block_spin.setSingleStep(2)
+            block_spin.setValue(15)
+            form_layout.addRow("Block Size:", block_spin)
+            self.param_widgets['block_size'] = block_spin
+            
+            c_spin = QSpinBox()
+            c_spin.setRange(1, 10)
+            c_spin.setValue(2)
+            form_layout.addRow("C Constant:", c_spin)
+            self.param_widgets['c_constant'] = c_spin
+            
+            dilate_spin = QSpinBox()
+            dilate_spin.setRange(0, 5)
+            dilate_spin.setValue(1)
+            form_layout.addRow("Dilation Iterations:", dilate_spin)
+            self.param_widgets['dilate_iterations'] = dilate_spin
+            
+        elif method_index == 2:  # Method 2 (Simple Thresholding)
+            block_spin = QSpinBox()
+            block_spin.setRange(3, 51)
+            block_spin.setSingleStep(2)
+            block_spin.setValue(15)
+            form_layout.addRow("Block Size:", block_spin)
+            self.param_widgets['block_size'] = block_spin
+            
+            c_spin = QSpinBox()
+            c_spin.setRange(0, 10)
+            c_spin.setValue(2)
+            form_layout.addRow("C Constant:", c_spin)
+            self.param_widgets['c_constant'] = c_spin
+            
+            pre_blur_spin = QSpinBox()
+            pre_blur_spin.setRange(0, 15)
+            pre_blur_spin.setValue(5)
+            form_layout.addRow("Pre-blur:", pre_blur_spin)
+            self.param_widgets['pre_blur'] = pre_blur_spin
+            
+            post_blur_spin = QSpinBox()
+            post_blur_spin.setRange(0, 15)
+            post_blur_spin.setValue(0)
+            form_layout.addRow("Post-blur:", post_blur_spin)
+            self.param_widgets['post_blur'] = post_blur_spin
+            
+        elif method_index == 3:  # Method 3 (HSV Space)
+            # Saturation threshold
+            s_spin = QSpinBox()
+            s_spin.setRange(0, 255)
+            s_spin.setValue(30)
+            form_layout.addRow("Saturation Threshold:", s_spin)
+            self.param_widgets['s_threshold'] = s_spin
+            
+            # Value threshold
+            v_spin = QSpinBox()
+            v_spin.setRange(0, 255)
+            v_spin.setValue(30)
+            form_layout.addRow("Value Threshold:", v_spin)
+            self.param_widgets['v_threshold'] = v_spin
+            
+            # Morph open size
+            open_spin = QSpinBox()
+            open_spin.setRange(1, 15)
+            open_spin.setValue(3)
+            form_layout.addRow("Morph Open Size:", open_spin)
+            self.param_widgets['morph_open_size'] = open_spin
+            
+            # Morph close size
+            close_spin = QSpinBox()
+            close_spin.setRange(1, 15)
+            close_spin.setValue(5)
+            form_layout.addRow("Morph Close Size:", close_spin)
+            self.param_widgets['morph_close_size'] = close_spin
+            
+            # Minimum contour area
+            area_spin = QDoubleSpinBox()
+            area_spin.setRange(0.01, 1.0)
+            area_spin.setSingleStep(0.05)
+            area_spin.setValue(0.1)
+            form_layout.addRow("Min Contour Area (%):", area_spin)
+            self.param_widgets['min_contour_area'] = area_spin
+            
+            # Stray pixel threshold
+            stray_spin = QDoubleSpinBox()
+            stray_spin.setRange(0.001, 0.5)  # 0.1% to 50% of image area
+            stray_spin.setSingleStep(0.005)
+            stray_spin.setValue(0.01)  # Default: 1% of image area
+            form_layout.addRow("Max Stray Pixel Area (%):", stray_spin)
+            self.param_widgets['max_stray_area'] = stray_spin
+            
+            # Feathering type
+            feather_combo = QComboBox()
+            feather_combo.addItems(["None", "Gaussian", "Bilateral", "Morphological"])
+            feather_combo.setCurrentIndex(1)  # Default to Gaussian
+            form_layout.addRow("Feathering Type:", feather_combo)
+            self.param_widgets['feather_type'] = feather_combo
+            
+            # Feather amount
+            feather_slider = QSlider(Qt.Horizontal)
+            feather_slider.setRange(0, 20)
+            feather_slider.setValue(5)
+            feather_slider.setTickPosition(QSlider.TicksBelow)
+            feather_slider.setTickInterval(1)
+            form_layout.addRow("Feathering Amount:", feather_slider)
+            self.param_widgets['feather_amount'] = feather_slider
+            
+            # Feather value display
+            feather_value = QLabel("5")
+            feather_value.setAlignment(Qt.AlignCenter)
+            form_layout.addRow("", feather_value)  # Empty label for alignment
+            
+            # Connect slider to value display
+            feather_slider.valueChanged.connect(lambda v: feather_value.setText(str(v)))
+            
+            # Debug checkbox
+            debug_check = QCheckBox()
+            debug_check.setChecked(False)
+            form_layout.addRow("Debug Output:", debug_check)
+            self.param_widgets['debug'] = debug_check
+            
+        elif method_index == 4:  # Black Background
             block_spin = QSpinBox()
             block_spin.setRange(3, 51)
             block_spin.setSingleStep(2)
@@ -1207,38 +1308,87 @@ class MainWindow(QMainWindow):
             form_layout.addRow("Dilation Iterations:", dilate_spin)
             self.param_widgets['dilation_iterations'] = dilate_spin
         
-        elif method_index == 6:  # K-Means
-            k_spin = QSpinBox()
-            k_spin.setRange(2, 10)
-            k_spin.setValue(2)
-            form_layout.addRow("Clusters:", k_spin)
-            self.param_widgets['k_clusters'] = k_spin
-            
-            mode_combo = QComboBox()
-            mode_combo.addItems(["Darkest", "Brightest", "Largest"])
-            form_layout.addRow("Background Mode:", mode_combo)
-            self.param_widgets['bg_detection_mode'] = mode_combo
         
-        elif method_index == 7:  # GrabCut
-            clahe_spin = QDoubleSpinBox()
-            clahe_spin.setRange(0.5, 8.0)
-            clahe_spin.setSingleStep(0.5)
-            clahe_spin.setValue(4.0)
-            form_layout.addRow("CLAHE Clip Limit:", clahe_spin)
-            self.param_widgets['clahe_clip'] = clahe_spin
             
-            edge_slider = QSlider(Qt.Horizontal)
-            edge_slider.setRange(1, 5)
-            edge_slider.setValue(3)
-            form_layout.addRow("Edge Sensitivity:", edge_slider)
-            self.param_widgets['edge_sensitivity'] = edge_slider
+        elif method_index == 8:  # Neural Network (rembg)
+            model_combo = QComboBox()
+            model_combo.addItems(["u2net (High Quality)", "u2netp (Fast)"])
+            form_layout.addRow("Model:", model_combo)
+            self.param_widgets['rembg_model'] = model_combo
             
-            iter_spin = QSpinBox()
-            iter_spin.setRange(1, 20)
-            iter_spin.setValue(10)
-            form_layout.addRow("Iterations:", iter_spin)
-            self.param_widgets['iterations'] = iter_spin
+            alpha_check = QCheckBox()
+            alpha_check.setChecked(True)
+            form_layout.addRow("Use Alpha Matting:", alpha_check)
+            self.param_widgets['alpha_matting'] = alpha_check
+            
+            fg_thresh = QSpinBox()
+            fg_thresh.setRange(1, 255)
+            fg_thresh.setValue(240)
+            form_layout.addRow("Foreground Threshold:", fg_thresh)
+            self.param_widgets['alpha_fg_threshold'] = fg_thresh
+            
+            bg_thresh = QSpinBox()
+            bg_thresh.setRange(1, 255)
+            bg_thresh.setValue(10)
+            form_layout.addRow("Background Threshold:", bg_thresh)
+            self.param_widgets['alpha_bg_threshold'] = bg_thresh
+            
+            erode_size = QSpinBox()
+            erode_size.setRange(1, 30)
+            erode_size.setValue(10)
+            form_layout.addRow("Erode Size:", erode_size)
+            self.param_widgets['alpha_erode_size'] = erode_size
         
+        # Add to create_parameter_widgets
+        elif method_index == 10:  # DeepLabV3
+            confidence_spin = QDoubleSpinBox()
+            confidence_spin.setRange(0.1, 1.0)
+            confidence_spin.setSingleStep(0.1)
+            confidence_spin.setValue(0.5)
+            form_layout.addRow("Confidence Threshold:", confidence_spin)
+            self.param_widgets['deeplab_confidence'] = confidence_spin
+            
+            class_combo = QComboBox()
+            class_combo.addItems([
+                "Multiple classes",
+                "Person (15)",
+                "Book (73)", 
+                "Dining table (62)",
+                "Bowl (84)"
+            ])
+            form_layout.addRow("Object Class:", class_combo)
+            self.param_widgets['deeplab_class'] = class_combo
+            
+            resolution_combo = QComboBox()
+            resolution_combo.addItems(["320×320 (Fast)", "520×520 (Balanced)", "860×860 (Detailed)"])
+            resolution_combo.setCurrentIndex(1)  # Default to 520×520
+            form_layout.addRow("Input Resolution:", resolution_combo)
+            self.param_widgets['deeplab_resolution'] = resolution_combo
+        
+        elif method_index == 11:  # Detectron2
+            confidence_spin = QDoubleSpinBox()
+            confidence_spin.setRange(0.1, 1.0)
+            confidence_spin.setSingleStep(0.1)
+            confidence_spin.setValue(0.7)
+            form_layout.addRow("Confidence Threshold:", confidence_spin)
+            self.param_widgets['detectron_confidence'] = confidence_spin
+            confidence_spin.valueChanged.connect(self.queue_preview_update)
+        
+        
+            
+        
+        else:  # Methods without parameters
+            form_layout.addRow(QLabel("No adjustable parameters for this method."))
+        
+        # Add the form layout to our parameter group
+        self.param_layout.addLayout(form_layout)
+        
+        # Connect controls to preview updates (for all widgets)
+        for widget in self.param_widgets.values():
+            if isinstance(widget, (QSpinBox, QDoubleSpinBox, QSlider)):
+                widget.valueChanged.connect(self.queue_preview_update)
+            elif isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self.queue_preview_update)
         else:  # Methods without parameters
             form_layout.addRow(QLabel("No adjustable parameters for this method."))
         
@@ -1310,6 +1460,24 @@ class MainWindow(QMainWindow):
                 self.log_message("Processing cancelled: Output folder not created", error=True)
                 return
         
+        # Get the selected method
+        method = self.bg_method_dropdown.currentIndex() + 1  # 1-based
+        
+        # Check for Detectron2 dependency if method 11 is selected
+        if method == 11:  # Detectron2
+            try:
+                import detectron2
+            except ImportError:
+                QMessageBox.critical(
+                    self, 
+                    "Missing Dependency",
+                    "Detectron2 is not installed. Please install with:\n\n"
+                    "pip install torch torchvision\n"
+                    "pip install detectron2 -f https://dl.fbaipublicfiles.com/detectron2/wheels/cu102/torch1.9/index.html"
+                )
+                self.log_message("Error: Detectron2 not installed", error=True)
+                return
+                
         # Save settings before processing
         self.save_bg_settings()
         self.log_message("Background removal settings saved")
@@ -1328,29 +1496,67 @@ class MainWindow(QMainWindow):
         
         # Collect parameters based on selected method
         params = {}
-        if method == 4:  # Black Background
+        # In process_backgrounds method
+        if method == 1:  # Gaussian + Otsu
+            params['clahe_clip'] = self.param_widgets.get('clahe_clip', QDoubleSpinBox()).value()
+            params['block_size'] = self.param_widgets.get('block_size', QSpinBox()).value()
+            params['c_constant'] = self.param_widgets.get('c_constant', QSpinBox()).value()
+            params['dilate_iterations'] = self.param_widgets.get('dilate_iterations', QSpinBox()).value()
+        # When method 2 is selected
+        elif method == 2:  # Method 2 (Simple Thresholding)
+            params['block_size'] = self.param_widgets.get('block_size', QSpinBox()).value()
+            params['c_constant'] = self.param_widgets.get('c_constant', QSpinBox()).value()
+            params['pre_blur'] = self.param_widgets.get('pre_blur', QSpinBox()).value()
+            params['post_blur'] = self.param_widgets.get('post_blur', QSpinBox()).value()
+            
+        elif method == 3:  # HSV Space
+            params['s_threshold'] = self.param_widgets.get('s_threshold', QSpinBox()).value()
+            params['v_threshold'] = self.param_widgets.get('v_threshold', QSpinBox()).value()
+            params['morph_open_size'] = self.param_widgets.get('morph_open_size', QSpinBox()).value()
+            params['morph_close_size'] = self.param_widgets.get('morph_close_size', QSpinBox()).value()
+            params['min_contour_area'] = self.param_widgets.get('min_contour_area', QDoubleSpinBox()).value()
+            params['max_stray_area'] = self.param_widgets.get('max_stray_area', QDoubleSpinBox()).value()
+            params['debug'] = self.param_widgets.get('debug', QCheckBox()).isChecked()
+            feather_map = {
+                0: None, 
+                1: 'gaussian', 
+                2: 'bilateral', 
+                3: 'morph'
+            }
+            params['feather_type'] = feather_map.get(
+                self.param_widgets.get('feather_type', QComboBox()).currentIndex(),
+                None
+            )
+            params['feather_amount'] = self.param_widgets.get('feather_amount', QSlider()).value()
+            
+        elif method == 4:  # Black Background
             params['block_size'] = self.param_widgets.get('block_size', QSpinBox()).value()
             params['c_constant'] = self.param_widgets.get('c_constant', QSpinBox()).value()
         elif method == 5:  # Edge Detection
             params['low_threshold'] = self.param_widgets.get('low_threshold', QSpinBox()).value()
             params['high_threshold'] = self.param_widgets.get('high_threshold', QSpinBox()).value()
             params['dilation_iterations'] = self.param_widgets.get('dilation_iterations', QSpinBox()).value()
-        elif method == 6:  # K-means
-            params['k_clusters'] = self.param_widgets.get('k_clusters', QSpinBox()).value()
-            mode_map = {0: 'darkest', 1: 'brightest', 2: 'largest'}
-            mode_idx = self.param_widgets.get('bg_detection_mode', QComboBox()).currentIndex()
-            params['bg_detection_mode'] = mode_map.get(mode_idx, 'darkest')
-        elif method == 7:  # Enhanced GrabCut
-            params['clahe_clip'] = self.param_widgets.get('clahe_clip', QDoubleSpinBox()).value()
-            params['edge_sensitivity'] = self.param_widgets.get('edge_sensitivity', QSlider()).value()
-            params['iterations'] = self.param_widgets.get('iterations', QSpinBox()).value()
+        
+        elif method == 8:  # Neural Network (rembg)
+            model_map = {0: 'u2net', 1: 'u2netp'}
+            model_idx = self.param_widgets.get('rembg_model', QComboBox()).currentIndex()
+            params['model_name'] = model_map.get(model_idx, 'u2net')
+            
+            params['alpha_matting'] = self.param_widgets.get('alpha_matting', QCheckBox()).isChecked()
+            params['alpha_matting_foreground_threshold'] = self.param_widgets.get('alpha_fg_threshold', QSpinBox()).value()
+            params['alpha_matting_background_threshold'] = self.param_widgets.get('alpha_bg_threshold', QSpinBox()).value()
+            params['alpha_matting_erode_size'] = self.param_widgets.get('alpha_erode_size', QSpinBox()).value()
+        elif method == 11:  # Detectron2
+            params['detectron_confidence'] = self.param_widgets.get('detectron_confidence', QDoubleSpinBox()).value()
+        # Add this to the method selection (around line 1560)
+       
         
         # Collect background removal settings
         bg_settings = {
             'source_path': source_path,
             'output_path': output_path,
             'bg_remove_method': method,
-            'transparent_bg': self.transparent_bg_checkbox.isChecked(),
+            
             'params': params
         }
         
@@ -1358,7 +1564,7 @@ class MainWindow(QMainWindow):
         self.log_message(f"Source path: {source_path}")
         self.log_message(f"Output path: {output_path}")
         self.log_message(f"Method: {bg_settings['bg_remove_method']}")
-        self.log_message(f"Transparent background: {bg_settings['transparent_bg']}")
+        
         
         # Show progress bar
         self.progress_bar.setVisible(True)
@@ -1395,8 +1601,7 @@ class MainWindow(QMainWindow):
         bg_method = self.settings.value("bg_remove_method", 1, type=int)
         self.bg_method_dropdown.setCurrentIndex(bg_method - 1)  # Convert from 1-based to 0-based index
         
-        # Transparent background option
-        self.transparent_bg_checkbox.setChecked(self.settings.value("transparent_bg", False, type=bool))
+        
         
         # Update method description
         self.update_bg_method_description()
@@ -1406,7 +1611,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("bg_source_path", self.bg_source_input.text())
         self.settings.setValue("bg_output_path", self.bg_output_input.text())
         self.settings.setValue("bg_remove_method", self.bg_method_dropdown.currentIndex() + 1)  # Store as 1-based
-        self.settings.setValue("transparent_bg", self.transparent_bg_checkbox.isChecked())
+        
 
     def browse_bg_source(self):
         """Browse for Background Removal source folder"""
@@ -1427,15 +1632,15 @@ class MainWindow(QMainWindow):
         descriptions = [
             "Method 1: Uses Gaussian blur and color binning with Otsu thresholding. Slower but can handle noisy backgrounds.",
             "Method 2: Uses simple thresholding for best quality while maintaining good performance. Works best with white backgrounds.",
-            "Method 3: Works in HSV color space, better for handling shiny and reflective surfaces. Good for objects with high color contrast.",
+            "Method 3: Uses HSV color space with adjustable thresholds for saturation and value. Optimized for cuneiform tablets against dark backgrounds with configurable parameters.",
             "Method 4: Optimized for objects with black backgrounds. Uses adaptive thresholding to handle varying lighting conditions.",
             "Method 5: Uses edge detection to find object boundaries. Works well for objects with clear edges against any background color.",
-            "Method 6: Groups pixels by color using K-means clustering. Good for complex backgrounds with varying colors.",
-            "Method 7: Uses enhanced GrabCut algorithm optimized for cuneiform tablets against dark backgrounds. Features better edge detection and contrast enhancement.",
             "Method 8: Uses neural network segmentation for high-quality automatic background removal. Requires rembg library installation.",
-            "Method 9: Uses Otsu thresholding combined with watershed and contour refinement. Excellent for clay tablets with clear contrast.",
-            "Method 10: Uses pre-trained deep learning models (U-Net or DeepLabV3) for advanced segmentation. Requires PyTorch installation."
+            "Method 10: Uses pre-trained deep learning models (U-Net or DeepLabV3) for advanced segmentation. Requires PyTorch installation.",
+            "Method 11: Uses Detectron2's Mask R-CNN for Photoshop-like object selection. Provides high-quality automatic object detection and segmentation. Requires Detectron2 installation.",
+           
         ]
+        
         
         if 0 <= method_index < len(descriptions):
             self.bg_method_desc.setText(descriptions[method_index])
