@@ -52,7 +52,7 @@ A Python application built with PyQt5 for processing archaeological photographs 
 
 ## Generating the Executable (.exe)
 
-To create a standalone `.exe` for Windows, use PyInstaller.
+To create a standalone `.exe` for Windows, use PyInstaller with `app.py` as the entry point.
 
 ### Steps
 
@@ -62,39 +62,37 @@ To create a standalone `.exe` for Windows, use PyInstaller.
    ```
 
 2. **Run PyInstaller**:
-   In the directory containing `main.py`, run:
+   In the `tablet-processor` directory, run:
    ```bash
-   pyinstaller --name CuneiformTabletProcessor --windowed --onefile main.py
+   pyinstaller --name CuneiformTabletProcessor --windowed --onefile app.py
    ```
    - `--name`: Sets the executable name.
-   - `--windowed`: Runs without a console window (GUI mode).
+   - `--windowed`: Runs without a console window.
    - `--onefile`: Bundles into a single `.exe`.
 
 3. **Include Assets (if applicable)**:
    If you have an `assets` folder (e.g., for icons), include it:
    ```bash
-   pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" main.py
+   pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" app.py
    ```
    - Use `;` for Windows, `:` for Linux/macOS in `--add-data`.
    - `--icon` sets a custom icon (optional).
 
-4. **Locate the Executable**:
+4. **Handle Missing Modules**:
+   If PyQt5 modules are missing, add:
+   ```bash
+   pyinstaller --name CuneiformTabletProcessor --windowed --onefile --hidden-import PyQt5.sip app.py
+   ```
+
+5. **Locate the Executable**:
    Find the `.exe` at:
    - `dist\CuneiformTabletProcessor.exe`
 
-5. **Test the Executable**:
+6. **Test the Executable**:
    Run `CuneiformTabletProcessor.exe`. If it fails, remove `--windowed` to see errors:
    ```bash
-   pyinstaller --name CuneiformTabletProcessor --onefile main.py
+   pyinstaller --name CuneiformTabletProcessor --onefile app.py
    ```
-
-6. **Troubleshooting**:
-   - **Missing Modules**: Add `--hidden-import` for PyQt5 issues:
-     ```bash
-     pyinstaller --name CuneiformTabletProcessor --windowed --onefile --hidden-import PyQt5.sip main.py
-     ```
-   - **Large File Size**: Expect 50–200 MB due to PyQt5 and OpenCV.
-   - **Resource Paths**: If assets fail to load, consider Qt’s QResource system.
 
 7. **Create an Installer (Optional)**:
    Use **Inno Setup** or **InstallForge** to create a setup wizard:
@@ -105,7 +103,7 @@ To create a standalone `.exe` for Windows, use PyInstaller.
 ### Example Command
 For a single-file `.exe` with assets and an icon:
 ```bash
-pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" --hidden-import PyQt5.sip main.py
+pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" --hidden-import PyQt5.sip app.py
 ```
 
 ## User Guide
