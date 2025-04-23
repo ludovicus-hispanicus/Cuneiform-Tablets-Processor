@@ -25,6 +25,7 @@ A Python application built with PyQt5 for processing archaeological photographs 
    Place the project files in a directory (e.g., `cuneiform-tablet-processor`).
 
 2. **Create a Virtual Environment** (recommended):
+
    ```bash
    python -m venv venv
    .\venv\Scripts\activate  # Windows
@@ -32,6 +33,7 @@ A Python application built with PyQt5 for processing archaeological photographs 
    ```
 
 3. **Install Dependencies**:
+
    ```bash
    pip install PyQt5 opencv-python numpy pyinstaller
    ```
@@ -40,9 +42,11 @@ A Python application built with PyQt5 for processing archaeological photographs 
 
 1. Navigate to the project directory and activate the virtual environment (if used).
 2. Run the main script:
+
    ```bash
    python main.py
    ```
+
 3. The GUI allows you to:
    - Select a source folder containing tablet images (JPG, PNG, TIFF).
    - Choose an output folder for processed images.
@@ -57,29 +61,35 @@ To create a standalone `.exe` for Windows, use PyInstaller with `app.py` as the 
 ### Steps
 
 1. **Activate the Virtual Environment** (if used):
+
    ```bash
    .\venv\Scripts\activate  # Windows
    ```
 
 2. **Run PyInstaller**:
    In the `tablet-processor` directory, run:
+
    ```bash
    pyinstaller --name CuneiformTabletProcessor --windowed --onefile app.py
    ```
+
    - `--name`: Sets the executable name.
    - `--windowed`: Runs without a console window.
    - `--onefile`: Bundles into a single `.exe`.
 
 3. **Include Assets (if applicable)**:
    If you have an `assets` folder (e.g., for icons), include it:
+
    ```bash
    pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" app.py
    ```
+
    - Use `;` for Windows, `:` for Linux/macOS in `--add-data`.
    - `--icon` sets a custom icon (optional).
 
 4. **Handle Missing Modules**:
    If PyQt5 modules are missing, add:
+
    ```bash
    pyinstaller --name CuneiformTabletProcessor --windowed --onefile --hidden-import PyQt5.sip app.py
    ```
@@ -90,6 +100,7 @@ To create a standalone `.exe` for Windows, use PyInstaller with `app.py` as the 
 
 6. **Test the Executable**:
    Run `CuneiformTabletProcessor.exe`. If it fails, remove `--windowed` to see errors:
+
    ```bash
    pyinstaller --name CuneiformTabletProcessor --onefile app.py
    ```
@@ -101,7 +112,9 @@ To create a standalone `.exe` for Windows, use PyInstaller with `app.py` as the 
    - Build a `setup.exe`.
 
 ### Example Command
+
 For a single-file `.exe` with assets and an icon:
+
 ```bash
 pyinstaller --name CuneiformTabletProcessor --windowed --onefile --add-data "assets;assets" --icon="assets/app.ico" --hidden-import PyQt5.sip app.py
 ```
@@ -125,12 +138,13 @@ The application uses a single HSV-based background removal method with adjustabl
    - The log shows the processing step tied to the last changed parameter (e.g., “Applying gaussian feathering with amount=5”).
 
 ### Logging
+
 - The processing log focuses on the most recently changed parameter and its related step (e.g., mask creation for `s_threshold`, feathering for `feather_amount`).
 - Errors are highlighted in red with timestamps.
 
 ## Project Structure
 
-```
+```text
 tablet-processor/
 ├── app.py                      # Application entry point
 ├── gui
@@ -153,6 +167,7 @@ This project is licensed under the [GPL License](LICENSE), as required by PyQt5.
 ## Contributing
 
 Contributions are welcome! To contribute:
+
 1. Fork the project (if hosted).
 2. Create a feature branch (`git checkout -b feature/my-feature`).
 3. Commit changes (`git commit -m 'Add my feature'`).
