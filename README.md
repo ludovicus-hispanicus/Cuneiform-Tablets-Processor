@@ -133,12 +133,17 @@ The application uses a single HSV-based background removal method with adjustabl
 ## Project Structure
 
 ```
-cuneiform-tablet-processor/
-├── main.py                    # Main PyQt5 application script
-├── background_remover.py      # HSV-based background removal logic
-├── assets/                   # (Optional) Icons or sample images
-├── dist/                     # Generated .exe location
-└── README.md                 # This file
+tablet-processor/
+├── app.py                      # Application entry point
+├── gui
+|   ├── __init__.py
+|   ├── main_window.py          # Main UI implementation
+|   ├── settings.py             # Main UI implementation
+└── processing/
+    ├── __init__.py
+    ├── processor.py            # Core image processing pipeline
+    ├── raw_processor.py        # RAW file conversion module
+    └── background_remover.py   # Background removal implementations
 ```
 
 ## Credits and License
